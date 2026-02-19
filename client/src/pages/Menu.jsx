@@ -10,7 +10,7 @@ export default function Menu() {
   const [name, setName] = useState("");
   const [price, setPrice] = useState("");
   const [image_url, setImageUrl] = useState("");
-  const [is_available, setIsAvailable] = useState(true);
+  const [is_available, setIsAvailable] = useState("1"); // "1" or "0" (IMPORTANT)
   const [saving, setSaving] = useState(false);
 
   // UI controls
@@ -23,9 +23,9 @@ export default function Menu() {
     setLoading(true);
     try {
       const data = await api("/api/menu");
-      setItems(data);
+      setItems(Array.isArray(data) ? data : []);
     } catch (e) {
-      setErr(e.message);
+      setErr(e.message || "Request failed");
     } finally {
       setLoading(false);
     }
@@ -72,32 +72,34 @@ export default function Menu() {
           name: name.trim(),
           price: Number(price),
           image_url: image_url.trim() ? image_url.trim() : null,
-          is_available
-        }
+          is_available: Number(is_available), // 1 or 0
+        },
       });
 
       setName("");
       setPrice("");
       setImageUrl("");
-      setIsAvailable(true);
+      setIsAvailable("1");
       await load();
     } catch (e) {
-      setErr(e.message);
+      setErr(e.message || "Request failed");
     } finally {
       setSaving(false);
     }
   }
 
-  async function toggleAvailability(id, current) {
+  async function toggleAvailability(id, currentIsAvailableNumber) {
+    // backend expects PUT /api/menu/:id/toggle with { is_available: 1/0 }
     setErr("");
     try {
-      await api(`/api/menu/${id}`, {
+      const next = currentIsAvailableNumber === 1 ? 0 : 1;
+      await api(`/api/menu/${id}/toggle`, {
         method: "PUT",
-        body: { is_available: !current }
+        body: { is_available: next },
       });
       await load();
     } catch (e) {
-      setErr(e.message);
+      setErr(e.message || "Request failed");
     }
   }
 
@@ -110,7 +112,7 @@ export default function Menu() {
       await api(`/api/menu/${id}`, { method: "DELETE" });
       await load();
     } catch (e) {
-      setErr(e.message);
+      setErr(e.message || "Request failed");
     }
   }
 
@@ -137,10 +139,7 @@ export default function Menu() {
           <div className="menuKpis">
             <Kpi label="Total Items" value={loading ? "..." : totalCount} />
             <Kpi label="Available" value={loading ? "..." : availableCount} />
-            <Kpi
-              label="Unavailable"
-              value={loading ? "..." : totalCount - availableCount}
-            />
+            <Kpi label="Unavailable" value={loading ? "..." : totalCount - availableCount} />
           </div>
         </div>
 
@@ -178,14 +177,15 @@ export default function Menu() {
                   value={price}
                   onChange={(e) => setPrice(e.target.value)}
                   placeholder="e.g. 2500"
+                  inputMode="numeric"
                 />
               </label>
 
               <label className="field">
                 <span>Availability</span>
                 <select
-                  value={is_available ? "1" : "0"}
-                  onChange={(e) => setIsAvailable(e.target.value === "1")}
+                  value={is_available}
+                  onChange={(e) => setIsAvailable(e.target.value)}
                 >
                   <option value="1">Available</option>
                   <option value="0">Unavailable</option>
@@ -221,7 +221,10 @@ export default function Menu() {
         </div>
 
         <div className="menuFilters">
-          <select value={availabilityFilter} onChange={(e) => setAvailabilityFilter(e.target.value)}>
+          <select
+            value={availabilityFilter}
+            onChange={(e) => setAvailabilityFilter(e.target.value)}
+          >
             <option value="all">All</option>
             <option value="available">Available only</option>
             <option value="unavailable">Unavailable only</option>
@@ -245,7 +248,9 @@ export default function Menu() {
         </div>
       ) : filtered.length === 0 ? (
         <div className="menuEmpty">
-          <div className="menuEmptyIcon"><IconMenu /></div>
+          <div className="menuEmptyIcon">
+            <IconMenu />
+          </div>
           <div className="menuEmptyTitle">No items found</div>
           <div className="menuEmptyText">
             Try adjusting filters or add your first menu item above.
@@ -257,7 +262,7 @@ export default function Menu() {
             <MenuCard
               key={it.id}
               it={it}
-              onToggle={() => toggleAvailability(it.id, it.is_available === 1)}
+              onToggle={() => toggleAvailability(it.id, it.is_available)}
               onDelete={() => removeItem(it.id)}
             />
           ))}
@@ -363,12 +368,7 @@ function IconDish() {
         strokeWidth="2"
         opacity=".75"
       />
-      <path
-        d="M12 3v6"
-        stroke="currentColor"
-        strokeWidth="2"
-        opacity=".5"
-      />
+      <path d="M12 3v6" stroke="currentColor" strokeWidth="2" opacity=".5" />
     </svg>
   );
 }
