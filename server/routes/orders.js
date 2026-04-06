@@ -1,132 +1,391 @@
-import { Router } from "express";
-import { db } from "../db.js";
-import { auth } from "../middleware/auth.js";
-import { z } from "zod";
+import express from "express";
+import { pool } from "../db.js";
+import multer from "multer";
+import path from "path";
+import { fileURLToPath } from "url";
 
-const router = Router();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-function calcTotals(items, taxRate = 0.075, svcRate = 0.05) {
-  const subtotal = items.reduce((s, it) => s + (Number(it.unit_price) * Number(it.qty)), 0);
-  const tax = subtotal * taxRate;
-  const service_charge = subtotal * svcRate;
-  const total = subtotal + tax + service_charge;
-  return { subtotal, tax, service_charge, total };
+const paymentStorage = multer.diskStorage({
+  destination: path.join(__dirname, "../uploads"),
+  filename: (_req, file, cb) => {
+    cb(null, `${Date.now()}-${file.originalname.replace(/\s+/g, "-")}`);
+  },
+});
+
+const uploadProof = multer({ storage: paymentStorage });
+const router = express.Router();
+
+/* -------------------- helpers -------------------- */
+
+function safeJsonParse(value, fallback = null) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
 }
 
-router.get("/", auth, async (req, res) => {
-  const [rows] = await db.query(`
-    SELECT o.*, rt.label as table_label, u.full_name as created_by_name
-    FROM orders o
-    LEFT JOIN restaurant_tables rt ON rt.id = o.table_id
-    JOIN users u ON u.id = o.created_by
-    ORDER BY o.id DESC
-  `);
-  res.json(rows);
-});
+function normalizeItems(items) {
+  if (!Array.isArray(items)) return [];
 
-router.get("/:id", auth, async (req, res) => {
-  const id = Number(req.params.id);
+  return items
+    .map((item) => ({
+      menu_id: Number(item.menu_id || item.id || 0),
+      name: String(item.name || item.item_name || "").trim(),
+      price: Number(item.price || item.unit_price || 0),
+      quantity: Number(item.quantity || item.qty || 0),
+    }))
+    .filter((item) => item.name && item.quantity > 0);
+}
 
-  const [[order]] = await db.query("SELECT * FROM orders WHERE id=?", [id]);
-  if (!order) return res.status(404).json({ message: "Order not found" });
-
-  const [items] = await db.query(`
-    SELECT oi.*, m.name
-    FROM order_items oi
-    JOIN menu_items m ON m.id = oi.menu_item_id
-    WHERE oi.order_id=?
-    ORDER BY oi.id DESC
-  `, [id]);
-
-  const [[payment]] = await db.query("SELECT * FROM payments WHERE order_id=?", [id]);
-
-  res.json({ order, items, payment: payment || null });
-});
-
-router.post("/", auth, async (req, res) => {
-  const schema = z.object({ table_id: z.number().int().nullable().optional() });
-  const body = schema.safeParse(req.body);
-  if (!body.success) return res.status(400).json(body.error);
-
-  const { table_id = null } = body.data;
-  const [r] = await db.query(
-    "INSERT INTO orders(table_id,created_by,status) VALUES(?,?, 'open')",
-    [table_id, req.user.id]
+async function getEstimatedReadyMins(conn) {
+  const [rows] = await conn.query(
+    `
+    SELECT COUNT(*) AS activeCount
+    FROM orders
+    WHERE is_archived = 0
+      AND order_status IN ('new', 'preparing', 'ready')
+    `
   );
 
-  if (table_id) await db.query("UPDATE restaurant_tables SET status='occupied' WHERE id=?", [table_id]);
+  const activeCount = Number(rows?.[0]?.activeCount || 0);
+  return Math.max(15, Math.min(60, 10 + activeCount * 5));
+}
 
-  res.json({ id: r.insertId });
+async function deductInventory(conn, cartItems) {
+  for (const item of cartItems) {
+    const orderedQty = Number(item.quantity || 0);
+    if (orderedQty <= 0) continue;
+
+    const [rows] = await conn.query(
+      `
+      SELECT id, item_name, current_stock
+      FROM inventory
+      WHERE LOWER(item_name) = LOWER(?)
+      LIMIT 1
+      `,
+      [item.name]
+    );
+
+    if (!rows.length) continue;
+
+    const stockRow = rows[0];
+    const currentStock = Number(stockRow.current_stock || 0);
+
+    if (orderedQty > currentStock) {
+      throw new Error(`${item.name} only has ${currentStock} left in stock.`);
+    }
+
+    await conn.query(
+      `
+      UPDATE inventory
+      SET current_stock = current_stock - ?
+      WHERE id = ?
+      `,
+      [orderedQty, stockRow.id]
+    );
+  }
+}
+
+function formatOrderResponse(row) {
+  return {
+    ...row,
+    items:
+      typeof row.items === "string" ? safeJsonParse(row.items, row.items) : row.items,
+    notes:
+      typeof row.notes === "string" ? safeJsonParse(row.notes, row.notes) : row.notes,
+  };
+}
+
+function emitOrderUpdate(payload) {
+  try {
+    if (global.io) {
+      global.io.emit("order_update", payload);
+      console.log("🔥 EMITTED order_update:", payload);
+    }
+  } catch (error) {
+    console.error("SOCKET EMIT ERROR:", error);
+  }
+}
+
+function notifyAdmins(type, payload = {}) {
+  try {
+    const safePayload = {
+      orderId: payload.orderId ? Number(payload.orderId) : null,
+      title: payload.title || "",
+      message: payload.message || "",
+      meta: payload.meta || null,
+      createdAt: new Date().toISOString(),
+    };
+
+    if (typeof global.emitAdminNotification === "function") {
+      global.emitAdminNotification(type, safePayload);
+    } else if (global.io) {
+      global.io.to("admins").emit("admin:notification", {
+        id: `${type}-${safePayload.orderId || Date.now()}-${Date.now()}`,
+        type,
+        ...safePayload,
+      });
+    }
+
+    console.log(`📣 ADMIN NOTIFICATION -> ${type}:`, safePayload);
+  } catch (error) {
+    console.error("ADMIN NOTIFICATION ERROR:", error);
+  }
+}
+
+/* -------------------- GET all orders -------------------- */
+
+router.get("/", async (_req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `
+      SELECT
+        id,
+        items,
+        total_price,
+        order_status,
+        notes,
+        is_archived,
+        created_at,
+        customer_id,
+        delivery_address,
+        customer_phone,
+        payment_status,
+        payment_reference,
+        estimated_ready_mins
+      FROM orders
+      WHERE is_archived = 0
+      ORDER BY created_at DESC, id DESC
+      `
+    );
+
+    return res.json(rows.map(formatOrderResponse));
+  } catch (error) {
+    console.error("GET /api/orders error:", error);
+    return res.status(500).json({ message: "Failed to fetch orders." });
+  }
 });
 
-router.post("/:id/items", auth, async (req, res) => {
-  const order_id = Number(req.params.id);
+/* -------------------- POST generic order -------------------- */
 
-  const schema = z.object({
-    menu_item_id: z.number().int(),
-    qty: z.number().int().positive()
-  });
-  const body = schema.safeParse(req.body);
-  if (!body.success) return res.status(400).json(body.error);
+router.post("/", async (req, res) => {
+  const conn = await pool.getConnection();
 
-  const { menu_item_id, qty } = body.data;
+  try {
+    const {
+      items = [],
+      totalPrice = 0,
+      status = "new",
+      notes = "",
+      customer_id = null,
+      delivery_address = null,
+      customer_phone = null,
+      payment_status = "pending",
+      payment_reference = null,
+    } = req.body;
 
-  const [[item]] = await db.query("SELECT id, price FROM menu_items WHERE id=? AND is_available=1", [menu_item_id]);
-  if (!item) return res.status(400).json({ message: "Menu item not available" });
+    const normalizedItems = normalizeItems(items);
 
-  const unit_price = Number(item.price);
-  const line_total = unit_price * qty;
+    if (!normalizedItems.length) {
+      return res.status(400).json({ message: "Order items are required." });
+    }
 
-  await db.query(
-    "INSERT INTO order_items(order_id,menu_item_id,qty,unit_price,line_total) VALUES(?,?,?,?,?)",
-    [order_id, menu_item_id, qty, unit_price, line_total]
-  );
+    const estimatedReadyMins = await getEstimatedReadyMins(conn);
 
-  // Recalc totals
-  const [items] = await db.query("SELECT qty, unit_price FROM order_items WHERE order_id=?", [order_id]);
-  const totals = calcTotals(items);
+    await conn.beginTransaction();
 
-  await db.query(
-    "UPDATE orders SET subtotal=?, tax=?, service_charge=?, total=? WHERE id=?",
-    [totals.subtotal, totals.tax, totals.service_charge, totals.total, order_id]
-  );
+    await deductInventory(conn, normalizedItems);
 
-  res.json({ ok: true, totals });
+    const [result] = await conn.query(
+      `
+      INSERT INTO orders
+      (
+        items,
+        total_price,
+        order_status,
+        notes,
+        customer_id,
+        delivery_address,
+        customer_phone,
+        payment_status,
+        payment_reference,
+        estimated_ready_mins
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        JSON.stringify(normalizedItems),
+        Number(totalPrice || 0),
+        String(status || "new"),
+        typeof notes === "string" ? notes : JSON.stringify(notes),
+        customer_id || null,
+        delivery_address || null,
+        customer_phone || null,
+        payment_status || "pending",
+        payment_reference || null,
+        estimatedReadyMins,
+      ]
+    );
+
+    await conn.commit();
+
+    emitOrderUpdate({
+      orderId: Number(result.insertId),
+      type: "new_order",
+    });
+
+    notifyAdmins("new_order", {
+      orderId: Number(result.insertId),
+      title: "New Order",
+      message: `A new order #${result.insertId} has arrived.`,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: "Order created successfully.",
+      orderId: result.insertId,
+    });
+  } catch (error) {
+    await conn.rollback();
+    console.error("POST /api/orders error:", error);
+    return res.status(500).json({
+      message: error.message || "Failed to create order.",
+    });
+  } finally {
+    conn.release();
+  }
 });
 
-router.put("/:id/status", auth, async (req, res) => {
-  const id = Number(req.params.id);
-  const schema = z.object({ status: z.enum(["open","kitchen","served","closed","cancelled"]) });
-  const body = schema.safeParse(req.body);
-  if (!body.success) return res.status(400).json(body.error);
+/* -------------------- POST checkout place order -------------------- */
 
-  await db.query("UPDATE orders SET status=? WHERE id=?", [body.data.status, id]);
-  res.json({ ok: true });
+router.post("/place", async (req, res) => {
+  const conn = await pool.getConnection();
+
+  try {
+    const {
+      cartItems = [],
+      subtotal = 0,
+      deliveryFee = 0,
+      totalAmount = 0,
+      deliveryAddress = {},
+      customer_id = null,
+      payment_reference = null,
+    } = req.body;
+
+    const normalizedItems = normalizeItems(cartItems);
+
+    if (!normalizedItems.length) {
+      return res.status(400).json({ message: "Cart is empty." });
+    }
+
+    if (!String(deliveryAddress?.address || "").trim()) {
+      return res.status(400).json({ message: "Delivery address is required." });
+    }
+
+    const estimatedReadyMins = await getEstimatedReadyMins(conn);
+
+    await conn.beginTransaction();
+
+    await deductInventory(conn, normalizedItems);
+
+    const orderNotes = {
+      full_name: String(deliveryAddress?.full_name || "").trim(),
+      phone: String(deliveryAddress?.phone || "").trim(),
+      address: String(deliveryAddress?.address || "").trim(),
+      note: String(deliveryAddress?.note || "").trim(),
+      subtotal: Number(subtotal || 0),
+      deliveryFee: Number(deliveryFee || 0),
+    };
+
+    const [result] = await conn.query(
+      `
+      INSERT INTO orders
+      (
+        items,
+        total_price,
+        order_status,
+        notes,
+        customer_id,
+        delivery_address,
+        customer_phone,
+        payment_status,
+        payment_reference,
+        estimated_ready_mins
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        JSON.stringify(normalizedItems),
+        Number(totalAmount || 0),
+        "new",
+        JSON.stringify(orderNotes),
+        customer_id || null,
+        String(deliveryAddress?.address || "").trim(),
+        String(deliveryAddress?.phone || "").trim(),
+        "pending",
+        payment_reference || null,
+        estimatedReadyMins,
+      ]
+    );
+
+    await conn.commit();
+
+    emitOrderUpdate({
+      orderId: Number(result.insertId),
+      type: "new_order",
+    });
+
+    notifyAdmins("new_order", {
+      orderId: Number(result.insertId),
+      title: "New Order",
+      message: `A new order #${result.insertId} has arrived.`,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: "Order placed successfully.",
+      orderId: result.insertId,
+    });
+  } catch (error) {
+    await conn.rollback();
+    console.error("PLACE ORDER ERROR:", error);
+    return res.status(500).json({
+      message: error.message || "Failed to place order.",
+    });
+  } finally {
+    conn.release();
+  }
 });
 
-router.post("/:id/pay", auth, async (req, res) => {
-  const order_id = Number(req.params.id);
-  const schema = z.object({
-    method: z.enum(["cash","pos","transfer"]),
-    amount: z.number().positive(),
-    receipt_no: z.string().min(2).optional()
-  });
-  const body = schema.safeParse(req.body);
-  if (!body.success) return res.status(400).json(body.error);
+router.post("/payment-proof/:orderId", uploadProof.single("receipt"), async (req, res) => {
+  try {
+    const { orderId } = req.params;
 
-  const [[order]] = await db.query("SELECT * FROM orders WHERE id=?", [order_id]);
-  if (!order) return res.status(404).json({ message: "Order not found" });
+    if (!req.file) {
+      return res.status(400).json({ message: "Receipt file is required." });
+    }
 
-  await db.query(
-    "INSERT INTO payments(order_id,method,amount,receipt_no) VALUES(?,?,?,?)",
-    [order_id, body.data.method, body.data.amount, body.data.receipt_no || null]
-  );
+    const filePath = `/uploads/${req.file.filename}`;
 
-  await db.query("UPDATE orders SET status='closed' WHERE id=?", [order_id]);
+    await pool.query(
+      `UPDATE orders
+       SET payment_proof_url = ?, payment_status = 'submitted'
+       WHERE id = ?`,
+      [filePath, orderId]
+    );
 
-  if (order.table_id) await db.query("UPDATE restaurant_tables SET status='free' WHERE id=?", [order.table_id]);
-
-  res.json({ ok: true });
+    return res.json({
+      success: true,
+      message: "Payment proof uploaded successfully.",
+      payment_proof_url: filePath,
+    });
+  } catch (error) {
+    console.error("PAYMENT PROOF ERROR:", error);
+    return res.status(500).json({ message: "Failed to upload payment proof." });
+  }
 });
 
 export default router;
