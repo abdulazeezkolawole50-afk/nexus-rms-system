@@ -72,11 +72,13 @@ router.post("/initialize", async (req, res) => {
 
     const total = subtotal + DELIVERY_FEE;
     const reference = `NX_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+    const itemsValue = JSON.stringify(items);
 
     const [orderResult] = await conn.query(
       `
       INSERT INTO orders
       (
+        items,
         total_price,
         order_status,
         payment_status,
@@ -87,9 +89,10 @@ router.post("/initialize", async (req, res) => {
         note,
         created_at
       )
-      VALUES (?, 'new', 'pending', ?, ?, ?, ?, ?, NOW())
+      VALUES (?, ?, 'new', 'pending', ?, ?, ?, ?, ?, NOW())
       `,
       [
+        itemsValue,
         total,
         reference,
         payment_method,
